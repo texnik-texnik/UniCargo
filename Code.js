@@ -1714,39 +1714,46 @@ function sendPhotoFromDrive(chatId, fileId, caption) {
  * @param {string|number} chatId - ID чата.
  * @param {string} fileId - ID видеофайла на Google Диске.
  * @param {string} [caption] - Необязательный текст под видео.
+ * @returns {boolean} true если успешно, false если ошибка
  */
 function sendVideoFromDrive(chatId, fileId, caption) {
-  // Проверяем, есть ли вообще ID видео
   if (!fileId) {
     Logger.log("sendVideoFromDrive: fileId не предоставлен.");
-    return;
+    return false;
   }
-  
+
   try {
-    // Формируем публичную ссылку на файл на Google Диске
+    // Делаем файл доступным по ссылке
+    const f = DriveApp.getFileById(fileId);
+    try { f.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW); } catch (e) { }
+
     const videoUrl = `https://drive.google.com/uc?export=view&id=${fileId}`;
-    
-    // Формируем URL для отправки видео через Telegram Bot API
     const url = `https://api.telegram.org/bot${TOKEN}/sendVideo`;
-    
-    // Собираем данные для отправки
+
     const payload = {
       chat_id: String(chatId),
       video: videoUrl,
       caption: caption || ""
     };
-    
-    // Отправляем запрос в Telegram
-    UrlFetchApp.fetch(url, {
+
+    const response = UrlFetchApp.fetch(url, {
       method: "post",
       contentType: "application/json",
       payload: JSON.stringify(payload),
-      muteHttpExceptions: true // Не прерывать выполнение скрипта при ошибках
+      muteHttpExceptions: true
     });
 
+    const responseCode = response.getResponseCode();
+    if (responseCode === 200) {
+      return true;
+    } else {
+      Logger.log(`Telegram API error (${responseCode}): ${response.getContentText()}`);
+      return false;
+    }
+
   } catch (e) {
-    // Логируем ошибку, если что-то пошло не так
-    Logger.log(`Ошибка отправки видео с Drive (fileId: ${fileId}) в чат ${chatId}: ${e.message}`);
+    Logger.log(`Ошибка отправки видео (fileId: ${fileId}): ${e.message}`);
+    return false;
   }
 }
 
@@ -1886,15 +1893,14 @@ function debugLog(context, key, value) {
  *********************/
 
 /**
- * Массовая рассылка пользователям бота.
+ * Массовая рассылка видео пользователям бота.
  * Отправляет видео из Google Drive с текстовой подписью.
- * @param {string} videoFileId - ID видеофайла в Google Drive
- * @param {string} caption - Текст сообщения под видео
- * @param {string} [targetLang] - Язык для фильтрации (ru/tj) или null для всех
+ * Ограничение: макс. 20 видео в минуту (лимит Telegram)
  */
 function broadcastVideo(videoFileId, caption, targetLang) {
   if (!videoFileId) {
     Logger.log("broadcastVideo: не указан videoFileId");
+    notifyAdmins_("❌ Ошибка рассылки: не указан ID видео");
     return { success: 0, failed: 0, error: "Не указан ID видео" };
   }
 
@@ -1905,12 +1911,13 @@ function broadcastVideo(videoFileId, caption, targetLang) {
     return { success: 0, failed: 0, error: "Нет пользователей" };
   }
 
-  // Получаем всех пользователей (столбцы: userId, name, phone, date, lang, warehouse)
   const data = sheet.getRange(2, 1, lastRow - 1, 5).getValues();
   
   let successCount = 0;
   let failedCount = 0;
   const results = [];
+
+  Logger.log(`Начало рассылки видео. Всего пользователей: ${data.length}`);
 
   for (let i = 0; i < data.length; i++) {
     const [userId, name, phone, regDate, lang] = data[i];
@@ -1921,28 +1928,34 @@ function broadcastVideo(videoFileId, caption, targetLang) {
     }
 
     try {
-      sendVideoFromDrive(String(userId), videoFileId, caption);
-      successCount++;
-      results.push({ userId: String(userId), status: "sent" });
-      
-      // Пауза чтобы не превысить лимиты Telegram API
-      if ((i + 1) % 30 === 0) {
-        Utilities.sleep(1000);
+      const sent = sendVideoFromDrive(String(userId), videoFileId, caption);
+      if (sent !== false) {
+        successCount++;
+        results.push({ userId: String(userId), status: "sent" });
+      } else {
+        failedCount++;
+        results.push({ userId: String(userId), status: "failed" });
       }
+      
+      // Пауза 3 секунды между видео (лимит Telegram ~20 видео/мин)
+      Utilities.sleep(3000);
+      
     } catch (e) {
       failedCount++;
       results.push({ userId: String(userId), status: "failed", error: String(e) });
       Logger.log(`Не удалось отправить пользователю ${userId}: ${e.message}`);
+      
+      // При ошибке тоже пауза
+      Utilities.sleep(1000);
     }
   }
 
-  Logger.log(`Рассылка завершена. Успешно: ${successCount}, Ошибок: ${failedCount}`);
+  Logger.log(`Рассылка видео завершена. Успешно: ${successCount}, Ошибок: ${failedCount}`);
   
-  // Уведомляем админа о результатах
-  const report = `📊 Рассылка завершена!\n\n` +
+  const report = `📊 Рассылка видео завершена!\n\n` +
     `✅ Успешно: ${successCount}\n` +
     `❌ Ошибок: ${failedCount}\n` +
-    `📝 Всего: ${successCount + failedCount}`;
+    `📝 Всего отправлено: ${successCount + failedCount}`;
   
   notifyAdmins_(report);
   
@@ -1951,8 +1964,7 @@ function broadcastVideo(videoFileId, caption, targetLang) {
 
 /**
  * Массовая текстовая рассылка пользователям бота.
- * @param {string} message - Текст сообщения
- * @param {string} [targetLang] - Язык для фильтрации (ru/tj) или null для всех
+ * Ограничение: макс. 30 сообщений в секунду
  */
 function broadcastText(message, targetLang) {
   const sheet = getUsersSheet_();
@@ -1967,6 +1979,8 @@ function broadcastText(message, targetLang) {
   let successCount = 0;
   let failedCount = 0;
 
+  Logger.log(`Начало текстовой рассылки. Всего пользователей: ${data.length}`);
+
   for (let i = 0; i < data.length; i++) {
     const [userId, , , , lang] = data[i];
     
@@ -1978,9 +1992,9 @@ function broadcastText(message, targetLang) {
       sendMessage(String(userId), message);
       successCount++;
       
-      // Пауза каждые 30 сообщений
+      // Пауза каждые 30 сообщений (0.5 сек)
       if ((i + 1) % 30 === 0) {
-        Utilities.sleep(1000);
+        Utilities.sleep(500);
       }
     } catch (e) {
       failedCount++;
@@ -2030,7 +2044,6 @@ function handleBroadcastCommand(chatId, userId, args) {
   const text = args.slice(1).join(" ");
 
   if (type === "video") {
-    // Парсим: video <fileId> <текст>
     const parts = text.split(/\s+/);
     if (parts.length < 2) {
       sendMessage(chatId, "❌ Укажите fileId и текст. Пример: /broadcast video 1ABC...xyz Текст сообщения");
@@ -2039,16 +2052,32 @@ function handleBroadcastCommand(chatId, userId, args) {
     const fileId = parts[0];
     const caption = parts.slice(1).join(" ");
     
-    sendMessage(chatId, "🔄 Запускаю рассылку видео... Это может занять несколько минут.");
-    const result = broadcastVideo(fileId, caption, null);
+    sendMessage(chatId, "🔄 Запускаю рассылку видео... Это может занять несколько минут. Вы получите отчёт.");
+    // Запускаем рассылку и сразу возвращаем управление
+    try {
+      broadcastVideo(fileId, caption, null);
+    } catch (e) {
+      sendMessage(chatId, "❌ Ошибка рассылки: " + e.message);
+      Logger.log("broadcastVideo error: " + e);
+    }
     
   } else if (type === "text") {
-    sendMessage(chatId, "🔄 Запускаю текстовую рассылку... Это может занять несколько минут.");
-    const result = broadcastText(text, null);
+    sendMessage(chatId, "🔄 Запускаю текстовую рассылку... Это может занять несколько минут. Вы получите отчёт.");
+    try {
+      broadcastText(text, null);
+    } catch (e) {
+      sendMessage(chatId, "❌ Ошибка рассылки: " + e.message);
+      Logger.log("broadcastText error: " + e);
+    }
     
   } else if (type === "ru" || type === "tj") {
     sendMessage(chatId, `🔄 Запускаю рассылку ${type === "ru" ? "русскоязычным" : "таджикскоязычным"}...`);
-    const result = broadcastText(text, type);
+    try {
+      broadcastText(text, type);
+    } catch (e) {
+      sendMessage(chatId, "❌ Ошибка рассылки: " + e.message);
+      Logger.log("broadcastText error: " + e);
+    }
     
   } else {
     sendMessage(chatId, "❌ Неверный тип рассылки. Используйте: video, text, ru, или tj");
