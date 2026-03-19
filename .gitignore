@@ -1,0 +1,17 @@
+# Clasp / Apps Script
+.claspignore
+appsscript.json
+*.gs
+
+# Node modules
+node_modules/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Temporary files
+*.tmp
