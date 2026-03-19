@@ -524,6 +524,12 @@ function doPost(e) {
       "/broadcast": () => {
         const args = text.split(/\s+/).slice(1); // убираем команду, оставляем аргументы
         handleBroadcastCommand(chatId, userId, args);
+      },
+      "/stopbroadcast": () => {
+        if (!isAdmin_(userId)) { sendMessage(chatId, L.admin_only); return; }
+        setBroadcastFlag_(false);
+        sendMessage(chatId, "🛑 Рассылка остановлена.");
+        Logger.log("Рассылка остановлена администратором");
       }
     };
 
@@ -1893,73 +1899,109 @@ function debugLog(context, key, value) {
  *********************/
 
 /**
+ * Проверка, не запущена ли уже рассылка
+ */
+function isBroadcastRunning_() {
+  const props = PropertiesService.getScriptProperties();
+  return props.getProperty("BROADCAST_RUNNING") === "1";
+}
+
+/**
+ * Установка флага рассылки
+ */
+function setBroadcastFlag_(running) {
+  const props = PropertiesService.getScriptProperties();
+  if (running) {
+    props.setProperty("BROADCAST_RUNNING", "1");
+  } else {
+    props.deleteProperty("BROADCAST_RUNNING");
+  }
+}
+
+/**
  * Массовая рассылка видео пользователям бота.
  * Отправляет видео из Google Drive с текстовой подписью.
  * Ограничение: макс. 20 видео в минуту (лимит Telegram)
  */
 function broadcastVideo(videoFileId, caption, targetLang) {
-  if (!videoFileId) {
-    Logger.log("broadcastVideo: не указан videoFileId");
-    notifyAdmins_("❌ Ошибка рассылки: не указан ID видео");
-    return { success: 0, failed: 0, error: "Не указан ID видео" };
+  // Проверка: не запущена ли уже рассылка
+  if (isBroadcastRunning_()) {
+    Logger.log("broadcastVideo: рассылка уже запущена, пропускаем");
+    notifyAdmins_("⚠️ Попытка запуска рассылки отклонена: другая рассылка уже выполняется");
+    return { success: 0, failed: 0, error: "Рассылка уже запущена" };
   }
-
-  const sheet = getUsersSheet_();
-  const lastRow = sheet.getLastRow();
-  if (lastRow < 2) {
-    Logger.log("broadcastVideo: нет пользователей");
-    return { success: 0, failed: 0, error: "Нет пользователей" };
-  }
-
-  const data = sheet.getRange(2, 1, lastRow - 1, 5).getValues();
   
-  let successCount = 0;
-  let failedCount = 0;
-  const results = [];
+  // Устанавливаем флаг
+  setBroadcastFlag_(true);
+  
+  try {
+    if (!videoFileId) {
+      Logger.log("broadcastVideo: не указан videoFileId");
+      notifyAdmins_("❌ Ошибка рассылки: не указан ID видео");
+      return { success: 0, failed: 0, error: "Не указан ID видео" };
+    }
 
-  Logger.log(`Начало рассылки видео. Всего пользователей: ${data.length}`);
+    const sheet = getUsersSheet_();
+    const lastRow = sheet.getLastRow();
+    if (lastRow < 2) {
+      Logger.log("broadcastVideo: нет пользователей");
+      return { success: 0, failed: 0, error: "Нет пользователей" };
+    }
 
-  for (let i = 0; i < data.length; i++) {
-    const [userId, name, phone, regDate, lang] = data[i];
+    const data = sheet.getRange(2, 1, lastRow - 1, 5).getValues();
     
-    // Фильтр по языку если указан
-    if (targetLang && String(lang) !== targetLang) {
-      continue;
-    }
+    let successCount = 0;
+    let failedCount = 0;
+    const results = [];
 
-    try {
-      const sent = sendVideoFromDrive(String(userId), videoFileId, caption);
-      if (sent !== false) {
-        successCount++;
-        results.push({ userId: String(userId), status: "sent" });
-      } else {
-        failedCount++;
-        results.push({ userId: String(userId), status: "failed" });
+    Logger.log(`Начало рассылки видео. Всего пользователей: ${data.length}`);
+
+    for (let i = 0; i < data.length; i++) {
+      const [userId, name, phone, regDate, lang] = data[i];
+
+      // Фильтр по языку если указан
+      if (targetLang && String(lang) !== targetLang) {
+        continue;
       }
-      
-      // Пауза 3 секунды между видео (лимит Telegram ~20 видео/мин)
-      Utilities.sleep(3000);
-      
-    } catch (e) {
-      failedCount++;
-      results.push({ userId: String(userId), status: "failed", error: String(e) });
-      Logger.log(`Не удалось отправить пользователю ${userId}: ${e.message}`);
-      
-      // При ошибке тоже пауза
-      Utilities.sleep(1000);
-    }
-  }
 
-  Logger.log(`Рассылка видео завершена. Успешно: ${successCount}, Ошибок: ${failedCount}`);
-  
-  const report = `📊 Рассылка видео завершена!\n\n` +
-    `✅ Успешно: ${successCount}\n` +
-    `❌ Ошибок: ${failedCount}\n` +
-    `📝 Всего отправлено: ${successCount + failedCount}`;
-  
-  notifyAdmins_(report);
-  
-  return { success: successCount, failed: failedCount, results: results };
+      try {
+        const sent = sendVideoFromDrive(String(userId), videoFileId, caption);
+        if (sent !== false) {
+          successCount++;
+          results.push({ userId: String(userId), status: "sent" });
+        } else {
+          failedCount++;
+          results.push({ userId: String(userId), status: "failed" });
+        }
+
+        // Пауза 3 секунды между видео (лимит Telegram ~20 видео/мин)
+        Utilities.sleep(3000);
+
+      } catch (e) {
+        failedCount++;
+        results.push({ userId: String(userId), status: "failed", error: String(e) });
+        Logger.log(`Не удалось отправить пользователю ${userId}: ${e.message}`);
+
+        // При ошибке тоже пауза
+        Utilities.sleep(1000);
+      }
+    }
+
+    Logger.log(`Рассылка видео завершена. Успешно: ${successCount}, Ошибок: ${failedCount}`);
+
+    const report = `📊 Рассылка видео завершена!\n\n` +
+      `✅ Успешно: ${successCount}\n` +
+      `❌ Ошибок: ${failedCount}\n` +
+      `📝 Всего отправлено: ${successCount + failedCount}`;
+
+    notifyAdmins_(report);
+
+    return { success: successCount, failed: failedCount, results: results };
+    
+  } finally {
+    // Снимаем флаг после завершения (успешно или с ошибкой)
+    setBroadcastFlag_(false);
+  }
 }
 
 /**
@@ -1967,51 +2009,67 @@ function broadcastVideo(videoFileId, caption, targetLang) {
  * Ограничение: макс. 30 сообщений в секунду
  */
 function broadcastText(message, targetLang) {
-  const sheet = getUsersSheet_();
-  const lastRow = sheet.getLastRow();
-  if (lastRow < 2) {
-    Logger.log("broadcastText: нет пользователей");
-    return { success: 0, failed: 0, error: "Нет пользователей" };
+  // Проверка: не запущена ли уже рассылка
+  if (isBroadcastRunning_()) {
+    Logger.log("broadcastText: рассылка уже запущена, пропускаем");
+    notifyAdmins_("⚠️ Попытка запуска рассылки отклонена: другая рассылка уже выполняется");
+    return { success: 0, failed: 0, error: "Рассылка уже запущена" };
   }
-
-  const data = sheet.getRange(2, 1, lastRow - 1, 5).getValues();
   
-  let successCount = 0;
-  let failedCount = 0;
+  // Устанавливаем флаг
+  setBroadcastFlag_(true);
+  
+  try {
+    const sheet = getUsersSheet_();
+    const lastRow = sheet.getLastRow();
+    if (lastRow < 2) {
+      Logger.log("broadcastText: нет пользователей");
+      return { success: 0, failed: 0, error: "Нет пользователей" };
+    }
 
-  Logger.log(`Начало текстовой рассылки. Всего пользователей: ${data.length}`);
-
-  for (let i = 0; i < data.length; i++) {
-    const [userId, , , , lang] = data[i];
+    const data = sheet.getRange(2, 1, lastRow - 1, 5).getValues();
     
-    if (targetLang && String(lang) !== targetLang) {
-      continue;
-    }
+    let successCount = 0;
+    let failedCount = 0;
 
-    try {
-      sendMessage(String(userId), message);
-      successCount++;
+    Logger.log(`Начало текстовой рассылки. Всего пользователей: ${data.length}`);
+
+    for (let i = 0; i < data.length; i++) {
+      const [userId, , , , lang] = data[i];
       
-      // Пауза каждые 30 сообщений (0.5 сек)
-      if ((i + 1) % 30 === 0) {
-        Utilities.sleep(500);
+      if (targetLang && String(lang) !== targetLang) {
+        continue;
       }
-    } catch (e) {
-      failedCount++;
-      Logger.log(`Не удалось отправить пользователю ${userId}: ${e.message}`);
-    }
-  }
 
-  Logger.log(`Текстовая рассылка завершена. Успешно: ${successCount}, Ошибок: ${failedCount}`);
-  
-  const report = `📊 Текстовая рассылка завершена!\n\n` +
-    `✅ Успешно: ${successCount}\n` +
-    `❌ Ошибок: ${failedCount}\n` +
-    `📝 Всего: ${successCount + failedCount}`;
-  
-  notifyAdmins_(report);
-  
-  return { success: successCount, failed: failedCount };
+      try {
+        sendMessage(String(userId), message);
+        successCount++;
+        
+        // Пауза каждые 30 сообщений (0.5 сек)
+        if ((i + 1) % 30 === 0) {
+          Utilities.sleep(500);
+        }
+      } catch (e) {
+        failedCount++;
+        Logger.log(`Не удалось отправить пользователю ${userId}: ${e.message}`);
+      }
+    }
+
+    Logger.log(`Текстовая рассылка завершена. Успешно: ${successCount}, Ошибок: ${failedCount}`);
+    
+    const report = `📊 Текстовая рассылка завершена!\n\n` +
+      `✅ Успешно: ${successCount}\n` +
+      `❌ Ошибок: ${failedCount}\n` +
+      `📝 Всего: ${successCount + failedCount}`;
+    
+    notifyAdmins_(report);
+    
+    return { success: successCount, failed: failedCount };
+    
+  } finally {
+    // Снимаем флаг после завершения
+    setBroadcastFlag_(false);
+  }
 }
 
 /**
